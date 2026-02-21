@@ -1,0 +1,855 @@
+# PIPELINE DEFINITION
+# Name: docs-agent-ingestion-backbone
+# Description: Deterministic ingestion backbone for docs + diagrams.
+# Inputs:
+#    git_ref: str [Default: 'master']
+#    repo_url: str [Default: 'https://github.com/kubeflow/pipelines.git']
+components:
+  comp-extract-text-docs:
+    executorLabel: exec-extract-text-docs
+    inputDefinitions:
+      artifacts:
+        source_volume:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+        text_file_manifest:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        structured_text_chunks:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-fetch-sources:
+    executorLabel: exec-fetch-sources
+    inputDefinitions:
+      parameters:
+        git_ref:
+          parameterType: STRING
+        repo_url:
+          parameterType: STRING
+    outputDefinitions:
+      artifacts:
+        provenance_metadata:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        source_volume:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+  comp-filter-manifest:
+    executorLabel: exec-filter-manifest
+    inputDefinitions:
+      artifacts:
+        source_volume:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        text_file_manifest:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        visual_file_manifest:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-persist-and-optimize:
+    executorLabel: exec-persist-and-optimize
+    inputDefinitions:
+      artifacts:
+        validated_knowledge_bank:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        retrieval_ready_records:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-process-visual-artifacts:
+    executorLabel: exec-process-visual-artifacts
+    inputDefinitions:
+      artifacts:
+        source_volume:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+        visual_file_manifest:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        structured_visual_artifacts:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-structure-platform-knowledge:
+    executorLabel: exec-structure-platform-knowledge
+    inputDefinitions:
+      artifacts:
+        provenance_metadata:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        structured_text_chunks:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        structured_visual_artifacts:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        structured_knowledge_artifacts:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-validate-ingestion-output:
+    executorLabel: exec-validate-ingestion-output
+    inputDefinitions:
+      artifacts:
+        source_volume:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+        structured_knowledge_artifacts:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        validated_knowledge_bank:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        validation_report:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+deploymentSpec:
+  executors:
+    exec-extract-text-docs:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - extract_text_docs
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef extract_text_docs(\n    source_volume: Input[Artifact],\n   \
+          \ text_file_manifest: Input[Dataset],\n    structured_text_chunks: Output[Dataset],\n\
+          ):\n    \"\"\"Stage 2A: Convert text assets into structured, context-aware\
+          \ chunks.\n\n    Behavior:\n    - Markdown: header-aware chunking with fenced\
+          \ code block extraction\n    - Non-Markdown text: single chunk fallback\n\
+          \    - Extracts image references for Stage 3 visual context injection\n\
+          \    \"\"\"\n    import json\n    import os\n    import re\n\n    repo_root\
+          \ = os.path.join(source_volume.path, 'repo')\n    with open(text_file_manifest.path,\
+          \ 'r', encoding='utf-8') as f:\n        manifests = json.load(f)\n\n   \
+          \ heading_pattern = re.compile(r'^(#{1,6})\\s+(.*\\S)\\s*$')\n    image_pattern\
+          \ = re.compile(r'!\\[[^\\]]*\\]\\(([^)]+)\\)')\n    fence_pattern = re.compile(r'^(```|~~~)\\\
+          s*([a-zA-Z0-9_+-]*)\\s*$')\n\n    def emit_chunk(out_handle, source_path,\
+          \ chunk_index, header_path, text_lines,\n                   code_blocks,\
+          \ image_refs):\n        text_content = '\\n'.join(text_lines).strip()\n\
+          \        if not text_content and not code_blocks and not image_refs:\n \
+          \           return chunk_index\n        record = {\n            'chunk_id':\
+          \ f'{source_path}::{chunk_index}',\n            'source_path': source_path,\n\
+          \            'header_path': list(header_path),\n            'text_content':\
+          \ text_content,\n            'code_blocks': code_blocks,\n            'image_references':\
+          \ sorted(image_refs),\n        }\n        out_handle.write(json.dumps(record)\
+          \ + '\\n')\n        return chunk_index + 1\n\n    with open(structured_text_chunks.path,\
+          \ 'w', encoding='utf-8') as out:\n        for item in manifests:\n     \
+          \       rel_path = item['path']\n            file_path = os.path.join(repo_root,\
+          \ rel_path)\n            if not os.path.isfile(file_path):\n           \
+          \     continue\n            with open(file_path, 'r', encoding='utf-8',\
+          \ errors='replace') as src:\n                lines = src.read().splitlines()\n\
+          \n            lowered = rel_path.lower()\n            if lowered.endswith('.md'):\n\
+          \                header_path = []\n                chunk_index = 0\n   \
+          \             text_lines = []\n                image_refs = set()\n    \
+          \            code_blocks = []\n                in_fence = False\n      \
+          \          fence_marker = None\n                fence_lang = ''\n      \
+          \          fence_lines = []\n\n                for line in lines:\n    \
+          \                if in_fence:\n                        close_match = fence_pattern.match(line)\n\
+          \                        if close_match and close_match.group(1) == fence_marker:\n\
+          \                            code_blocks.append({\n                    \
+          \            'language': fence_lang,\n                                'content':\
+          \ '\\n'.join(fence_lines).strip(),\n                            })\n   \
+          \                         in_fence = False\n                           \
+          \ fence_marker = None\n                            fence_lang = ''\n   \
+          \                         fence_lines = []\n                           \
+          \ continue\n                        fence_lines.append(line)\n         \
+          \               continue\n\n                    fence_match = fence_pattern.match(line)\n\
+          \                    if fence_match:\n                        in_fence =\
+          \ True\n                        fence_marker = fence_match.group(1)\n  \
+          \                      fence_lang = fence_match.group(2) or ''\n       \
+          \                 fence_lines = []\n                        continue\n\n\
+          \                    heading_match = heading_pattern.match(line)\n     \
+          \               if heading_match:\n                        chunk_index =\
+          \ emit_chunk(\n                            out_handle=out,\n           \
+          \                 source_path=rel_path,\n                            chunk_index=chunk_index,\n\
+          \                            header_path=header_path,\n                \
+          \            text_lines=text_lines,\n                            code_blocks=code_blocks,\n\
+          \                            image_refs=image_refs,\n                  \
+          \      )\n                        level = len(heading_match.group(1))\n\
+          \                        title = heading_match.group(2).strip()\n      \
+          \                  header_path = header_path[:level - 1] + [title]\n   \
+          \                     text_lines = []\n                        image_refs\
+          \ = set()\n                        code_blocks = []\n                  \
+          \      continue\n\n                    text_lines.append(line)\n       \
+          \             image_refs.update(image_pattern.findall(line))\n\n       \
+          \         if in_fence:\n                    code_blocks.append({\n     \
+          \                   'language': fence_lang,\n                        'content':\
+          \ '\\n'.join(fence_lines).strip(),\n                    })\n           \
+          \     emit_chunk(\n                    out_handle=out,\n               \
+          \     source_path=rel_path,\n                    chunk_index=chunk_index,\n\
+          \                    header_path=header_path,\n                    text_lines=text_lines,\n\
+          \                    code_blocks=code_blocks,\n                    image_refs=image_refs,\n\
+          \                )\n            else:\n                text = '\\n'.join(lines).strip()\n\
+          \                record = {\n                    'chunk_id': f'{rel_path}::0',\n\
+          \                    'source_path': rel_path,\n                    'header_path':\
+          \ [],\n                    'text_content': text,\n                    'code_blocks':\
+          \ [],\n                    'image_references': sorted(image_pattern.findall(text)),\n\
+          \                }\n                out.write(json.dumps(record) + '\\n')\n\
+          \n"
+        image: python:3.11
+    exec-fetch-sources:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - fetch_sources
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef fetch_sources(\n    repo_url: str,\n    git_ref: str,\n    source_volume:\
+          \ Output[Artifact],\n    provenance_metadata: Output[Dataset],\n):\n   \
+          \ \"\"\"Stage 1A: Clone repository snapshot and emit provenance metadata.\n\
+          \n    Inputs:\n    - repo_url: source repository URL\n    - git_ref: branch/tag\
+          \ to snapshot\n\n    Outputs:\n    - source_volume: directory artifact containing\
+          \ cloned repository at /repo\n    - provenance_metadata: JSON dataset with\
+          \ commit hash and ingestion metadata\n    \"\"\"\n    import datetime\n\
+          \    import json\n    import os\n    import shutil\n    import subprocess\n\
+          \n    source_root = source_volume.path\n    if os.path.exists(source_root):\n\
+          \        shutil.rmtree(source_root)\n    os.makedirs(source_root, exist_ok=True)\n\
+          \n    clone_target = os.path.join(source_root, 'repo')\n    subprocess.run(\n\
+          \        ['git', 'clone', '--depth', '1', '--branch', git_ref, repo_url,\
+          \ clone_target],\n        check=True,\n    )\n\n    commit_hash = subprocess.check_output(\n\
+          \        ['git', '-C', clone_target, 'rev-parse', 'HEAD'],\n        text=True,\n\
+          \    ).strip()\n\n    metadata = {\n        'repo_url': repo_url,\n    \
+          \    'git_ref': git_ref,\n        'commit_hash': commit_hash,\n        'snapshot_root':\
+          \ 'repo',\n        'ingested_at_utc': datetime.datetime.utcnow().replace(\n\
+          \            microsecond=0).isoformat() + 'Z',\n    }\n    with open(provenance_metadata.path,\
+          \ 'w', encoding='utf-8') as f:\n        json.dump(metadata, f, indent=2,\
+          \ sort_keys=True)\n\n"
+        image: python:3.11
+    exec-filter-manifest:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - filter_manifest
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef filter_manifest(\n    source_volume: Input[Artifact],\n    text_file_manifest:\
+          \ Output[Dataset],\n    visual_file_manifest: Output[Dataset],\n):\n   \
+          \ \"\"\"Stage 1B: Scan repository snapshot and classify text vs visual assets.\n\
+          \n    Inputs:\n    - source_volume (from fetch_sources)\n\n    Outputs:\n\
+          \    - text_file_manifest: JSON list of text files (.md/.rst/.txt)\n   \
+          \ - visual_file_manifest: JSON list of diagram/image files\n    \"\"\"\n\
+          \    import json\n    import os\n    from pathlib import Path\n\n    repo_root\
+          \ = os.path.join(source_volume.path, 'repo')\n    if not os.path.isdir(repo_root):\n\
+          \        raise FileNotFoundError(f'Repository snapshot not found: {repo_root}')\n\
+          \n    excluded_dirs = {\n        '.git',\n        '.idea',\n        '.venv',\n\
+          \        'venv',\n        'node_modules',\n        'vendor',\n        'build',\n\
+          \        'dist',\n    }\n    text_exts = {'.md', '.rst', '.txt'}\n    visual_exts\
+          \ = {'.png', '.svg', '.drawio.xml', '.mmd'}\n\n    text_entries = []\n \
+          \   visual_entries = []\n\n    for root, dirs, files in os.walk(repo_root):\n\
+          \        dirs[:] = [d for d in dirs if d not in excluded_dirs]\n       \
+          \ for filename in files:\n            full_path = os.path.join(root, filename)\n\
+          \            rel_path = Path(os.path.relpath(full_path, repo_root)).as_posix()\n\
+          \n            ext = ''.join(Path(filename).suffixes).lower()\n         \
+          \   if ext in text_exts:\n                text_entries.append({'path': rel_path,\
+          \ 'kind': 'text', 'ext': ext})\n            if ext in visual_exts:\n   \
+          \             visual_entries.append({'path': rel_path, 'kind': 'visual',\
+          \ 'ext': ext})\n\n    text_entries.sort(key=lambda x: x['path'])\n    visual_entries.sort(key=lambda\
+          \ x: x['path'])\n\n    with open(text_file_manifest.path, 'w', encoding='utf-8')\
+          \ as f:\n        json.dump(text_entries, f, indent=2)\n    with open(visual_file_manifest.path,\
+          \ 'w', encoding='utf-8') as f:\n        json.dump(visual_entries, f, indent=2)\n\
+          \n"
+        image: python:3.11
+    exec-persist-and-optimize:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - persist_and_optimize
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef persist_and_optimize(\n    validated_knowledge_bank: Input[Dataset],\n\
+          \    retrieval_ready_records: Output[Dataset],\n):\n    \"\"\"Stage 5: Build\
+          \ retrieval-ready records with idempotent persistence keys.\n\n    Behavior:\n\
+          \    - Flattens contextual text (header + body + visual context)\n    -\
+          \ Emits deterministic record_id/source_key hashes\n    - Emits an upsert/delete_scope\
+          \ contract for downstream vector stores\n    \"\"\"\n    import hashlib\n\
+          \    import json\n\n    def hash_text(value):\n        return hashlib.sha256(value.encode('utf-8')).hexdigest()\n\
+          \n    seen_record_ids = set()\n    with open(validated_knowledge_bank.path,\
+          \ 'r', encoding='utf-8') as inp, open(\n            retrieval_ready_records.path,\
+          \ 'w',\n            encoding='utf-8') as out:\n        for line in inp:\n\
+          \            if not line.strip():\n                continue\n          \
+          \  record = json.loads(line)\n            header_path = record.get('header_path',\
+          \ [])\n            text_content = record.get('text_content', '')\n     \
+          \       visual_context = record.get('visual_context', [])\n\n          \
+          \  retrieval_text = '\\n\\n'.join([\n                f\"header_path: {'\
+          \ > '.join(header_path) if header_path else '(root)'}\",\n             \
+          \   f\"text_content:\\n{text_content}\",\n                f\"visual_context:\\\
+          n{json.dumps(visual_context, sort_keys=True)}\",\n            ]).strip()\n\
+          \n            chunk_id = record.get('chunk_id', '')\n            source_path\
+          \ = record.get('source_path', '')\n            source_url = record.get('source_url',\
+          \ '')\n            commit_hash = record.get('commit_hash', '')\n       \
+          \     component = record.get('component', 'unknown')\n\n            record_id\
+          \ = hash_text(\n                f'{source_url}|{commit_hash}|{source_path}|{chunk_id}')\n\
+          \            if record_id in seen_record_ids:\n                continue\n\
+          \            seen_record_ids.add(record_id)\n\n            source_key =\
+          \ hash_text(f'{source_url}|{source_path}|{chunk_id}')\n            quality_tags\
+          \ = sorted(set(record.get('quality_tags', [])))\n            validation\
+          \ = record.get('validation', {})\n\n            metadata_payload = {\n \
+          \               'record_id': record_id,\n                'source_key': source_key,\n\
+          \                'source_url': source_url,\n                'source_path':\
+          \ source_path,\n                'chunk_id': chunk_id,\n                'component':\
+          \ component,\n                'commit_hash': commit_hash,\n            \
+          \    'git_ref': record.get('git_ref'),\n                'header_path': header_path,\n\
+          \                'quality_tags': quality_tags,\n                'has_broken_links':\
+          \ bool(validation.get('broken_links')),\n                'stability_tags':\
+          \ [\n                    tag for tag in quality_tags if tag.startswith('low_stability:')\n\
+          \                ],\n            }\n\n            output_record = {\n  \
+          \              'operation': 'upsert',\n                'record_id': record_id,\n\
+          \                'delete_scope': {\n                    'source_key': source_key,\n\
+          \                },\n                'source_path': source_path,\n     \
+          \           'commit_hash': commit_hash,\n                'component': component,\n\
+          \                'retrieval_text': retrieval_text,\n                'metadata':\
+          \ metadata_payload,\n            }\n            out.write(json.dumps(output_record)\
+          \ + '\\n')\n\n"
+        image: python:3.11
+    exec-process-visual-artifacts:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - process_visual_artifacts
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef process_visual_artifacts(\n    source_volume: Input[Artifact],\n\
+          \    visual_file_manifest: Input[Dataset],\n    structured_visual_artifacts:\
+          \ Output[Dataset],\n):\n    \"\"\"Stage 2B: Parse visual assets using a\
+          \ fidelity-aware strategy.\n\n    Fidelity order:\n    - .mmd (code-based\
+          \ diagrams)\n    - .drawio.xml (structured source)\n    - .svg / .png fallback\
+          \ (best-effort extraction)\n\n    Output is normalized JSONL containing\
+          \ labels/relationships/parse status.\n    \"\"\"\n    import json\n    import\
+          \ os\n    import re\n\n    try:\n        from defusedxml import ElementTree\
+          \ as ET\n    except ImportError:\n        from xml.etree import ElementTree\
+          \ as ET\n\n    repo_root = os.path.join(source_volume.path, 'repo')\n  \
+          \  with open(visual_file_manifest.path, 'r', encoding='utf-8') as f:\n \
+          \       manifests = json.load(f)\n\n    def parse_mermaid(raw_text):\n \
+          \       relationships = []\n        labels = set()\n        for line in\
+          \ raw_text.splitlines():\n            stripped = line.strip()\n        \
+          \    if not stripped:\n                continue\n            if '-->' in\
+          \ stripped or '---' in stripped:\n                relationships.append(stripped)\n\
+          \            labels.update(re.findall(r'\\[([^\\]]+)\\]|\\(([^)]+)\\)|\\\
+          {([^}]+)\\}', stripped))\n        flat_labels = []\n        for triple in\
+          \ labels:\n            value = next((entry for entry in triple if entry),\
+          \ '').strip()\n            if value:\n                flat_labels.append(value)\n\
+          \        return sorted(set(flat_labels)), relationships\n\n    def parse_drawio_xml(file_path):\n\
+          \        tree = ET.parse(file_path)\n        root = tree.getroot()\n   \
+          \     labels = set()\n        relationships = []\n        for elem in root.iter():\n\
+          \            raw_label = elem.attrib.get('value') or elem.attrib.get('label')\n\
+          \            if raw_label:\n                clean = re.sub(r'<[^>]+>', '\
+          \ ', raw_label)\n                clean = re.sub(r'\\s+', ' ', clean).strip()\n\
+          \                if clean:\n                    labels.add(clean)\n    \
+          \        if elem.attrib.get('edge') == '1':\n                src = elem.attrib.get('source',\
+          \ '')\n                dst = elem.attrib.get('target', '')\n           \
+          \     relationships.append({'source': src, 'target': dst})\n        return\
+          \ sorted(labels), relationships\n\n    def parse_svg(file_path):\n     \
+          \   labels = set()\n        relationships = []\n        tree = ET.parse(file_path)\n\
+          \        root = tree.getroot()\n        for elem in root.iter():\n     \
+          \       tag = elem.tag.lower()\n            if tag.endswith('text') and\
+          \ elem.text:\n                text = elem.text.strip()\n               \
+          \ if text:\n                    labels.add(text)\n            if tag.endswith('title')\
+          \ and elem.text:\n                title = elem.text.strip()\n          \
+          \      if title:\n                    labels.add(title)\n            if\
+          \ tag.endswith('line') or tag.endswith('path'):\n                relationships.append(tag.rsplit('}',\
+          \ 1)[-1])\n        return sorted(labels), relationships\n\n    with open(structured_visual_artifacts.path,\
+          \ 'w', encoding='utf-8') as out:\n        for item in manifests:\n     \
+          \       source_path = item['path']\n            full_path = os.path.join(repo_root,\
+          \ source_path)\n            lowered = source_path.lower()\n\n          \
+          \  labels = []\n            relationships = []\n            flow_descriptions\
+          \ = []\n            fidelity = 'pixel-fallback'\n            parse_status\
+          \ = 'ok'\n\n            if not os.path.isfile(full_path):\n            \
+          \    parse_status = 'source_file_missing'\n            elif lowered.endswith('.mmd'):\n\
+          \                fidelity = 'code-based'\n                with open(full_path,\
+          \ 'r', encoding='utf-8', errors='replace') as f:\n                    content\
+          \ = f.read()\n                labels, relationships = parse_mermaid(content)\n\
+          \                flow_descriptions = relationships[:]\n            elif\
+          \ lowered.endswith('.drawio.xml'):\n                fidelity = 'structured-diagram'\n\
+          \                try:\n                    labels, relationships = parse_drawio_xml(full_path)\n\
+          \                    flow_descriptions = [\n                        f\"\
+          edge {edge.get('source')} -> {edge.get('target')}\"\n                  \
+          \      for edge in relationships\n                    ]\n              \
+          \  except Exception:\n                    parse_status = 'drawio_parse_failed'\n\
+          \            elif lowered.endswith('.svg'):\n                fidelity =\
+          \ 'pixel-fallback'\n                try:\n                    labels, relationships\
+          \ = parse_svg(full_path)\n                    flow_descriptions = ['svg\
+          \ text extraction only']\n                except Exception:\n          \
+          \          parse_status = 'svg_parse_failed'\n            elif lowered.endswith('.png'):\n\
+          \                fidelity = 'pixel-fallback'\n                parse_status\
+          \ = 'ocr_not_configured'\n                flow_descriptions = [\n      \
+          \              'OCR fallback unavailable in this component runtime.',\n\
+          \                ]\n\n            record = {\n                'source_path':\
+          \ source_path,\n                'fidelity': fidelity,\n                'parse_status':\
+          \ parse_status,\n                'labels': labels,\n                'relationships':\
+          \ relationships,\n                'flow_descriptions': flow_descriptions,\n\
+          \            }\n            out.write(json.dumps(record) + '\\n')\n\n"
+        image: python:3.11
+    exec-structure-platform-knowledge:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - structure_platform_knowledge
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef structure_platform_knowledge(\n    structured_text_chunks: Input[Dataset],\n\
+          \    structured_visual_artifacts: Input[Dataset],\n    provenance_metadata:\
+          \ Input[Dataset],\n    structured_knowledge_artifacts: Output[Dataset],\n\
+          ):\n    \"\"\"Stage 3: Join structured text with diagram-derived knowledge.\n\
+          \n    Core logic:\n    - Builds in-memory index of visual artifacts by normalized\
+          \ source path\n    - Resolves text chunk image references relative to source\
+          \ document\n    - Injects matched visuals into chunk-level visual_context\n\
+          \    - Adds deterministic provenance/component metadata\n    \"\"\"\n  \
+          \  import json\n    import posixpath\n    import re\n\n    with open(provenance_metadata.path,\
+          \ 'r', encoding='utf-8') as f:\n        provenance = json.load(f)\n\n  \
+          \  def normalize_repo_path(base_doc_path, ref_path):\n        if not ref_path:\n\
+          \            return ''\n        cleaned = ref_path.strip()\n        cleaned\
+          \ = cleaned.split('#', 1)[0].split('?', 1)[0]\n        if not cleaned:\n\
+          \            return ''\n        if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://',\
+          \ cleaned):\n            return ''\n        if cleaned.startswith('/'):\n\
+          \            candidate = cleaned.lstrip('/')\n        else:\n          \
+          \  candidate = posixpath.normpath(\n                posixpath.join(posixpath.dirname(base_doc_path),\
+          \ cleaned))\n        if candidate.startswith('../'):\n            return\
+          \ ''\n        return candidate\n\n    def infer_component(source_path):\n\
+          \        parts = [part for part in source_path.split('/') if part]\n   \
+          \     preferred = {\n            'pipelines',\n            'katib',\n  \
+          \          'notebooks',\n            'training-operator',\n            'kserve',\n\
+          \            'centraldashboard',\n            'manifests',\n           \
+          \ 'sdk',\n            'backend',\n            'frontend',\n        }\n \
+          \       for part in parts:\n            if part in preferred:\n        \
+          \        return part\n        return parts[0] if parts else 'unknown'\n\n\
+          \    visual_index = {}\n    with open(structured_visual_artifacts.path,\
+          \ 'r', encoding='utf-8') as f:\n        for line in f:\n            if line.strip():\n\
+          \                record = json.loads(line)\n                visual_index[record['source_path']]\
+          \ = record\n\n    with open(structured_text_chunks.path, 'r', encoding='utf-8')\
+          \ as inp, open(\n            structured_knowledge_artifacts.path, 'w',\n\
+          \            encoding='utf-8') as out:\n        for line in inp:\n     \
+          \       if not line.strip():\n                continue\n            text_record\
+          \ = json.loads(line)\n            resolved_visual_refs = []\n          \
+          \  visual_context = []\n            for image_ref in text_record.get('image_references',\
+          \ []):\n                normalized_ref = normalize_repo_path(text_record['source_path'],\n\
+          \                                                    image_ref)\n      \
+          \          if not normalized_ref:\n                    continue\n      \
+          \          resolved_visual_refs.append(normalized_ref)\n               \
+          \ visual_record = visual_index.get(normalized_ref)\n                if visual_record:\n\
+          \                    visual_context.append(visual_record)\n\n          \
+          \  deduped_visual_context = []\n            seen_paths = set()\n       \
+          \     for visual in visual_context:\n                path = visual.get('source_path')\n\
+          \                if path in seen_paths:\n                    continue\n\
+          \                seen_paths.add(path)\n                deduped_visual_context.append(visual)\n\
+          \n            artifact = {\n                'chunk_id': text_record.get('chunk_id'),\n\
+          \                'source_path': text_record['source_path'],\n          \
+          \      'header_path': text_record['header_path'],\n                'text_content':\
+          \ text_record['text_content'],\n                'code_blocks': text_record.get('code_blocks',\
+          \ []),\n                'image_references': text_record.get('image_references',\
+          \ []),\n                'resolved_visual_references': sorted(set(resolved_visual_refs)),\n\
+          \                'visual_context': deduped_visual_context,\n           \
+          \     'commit_hash': provenance['commit_hash'],\n                'git_ref':\
+          \ provenance.get('git_ref'),\n                'snapshot_root': provenance.get('snapshot_root',\
+          \ 'repo'),\n                'source_url': provenance['repo_url'],\n    \
+          \            'ingested_at_utc': provenance.get('ingested_at_utc'),\n   \
+          \             'component': infer_component(text_record['source_path']),\n\
+          \            }\n            out.write(json.dumps(artifact) + '\\n')\n\n"
+        image: python:3.11
+    exec-validate-ingestion-output:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - validate_ingestion_output
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef validate_ingestion_output(\n    structured_knowledge_artifacts:\
+          \ Input[Dataset],\n    source_volume: Input[Artifact],\n    validated_knowledge_bank:\
+          \ Output[Dataset],\n    validation_report: Output[Artifact],\n):\n    \"\
+          \"\"Stage 4: Apply structural, navigational, and semantic guardrails.\n\n\
+          \    Guardrails:\n    - Structural integrity: required-field checks (drops\
+          \ invalid records)\n    - Navigational integrity: internal Markdown link\
+          \ existence checks\n    - Semantic quality: remove stubs/noise and tag low-stability\
+          \ content\n\n    Outputs:\n    - validated_knowledge_bank: validated/tagged\
+          \ JSONL artifacts\n    - validation_report: HTML summary with metrics and\
+          \ sample findings\n    \"\"\"\n    import json\n    import os\n    import\
+          \ posixpath\n    import re\n\n    repo_root = os.path.join(source_volume.path,\
+          \ 'repo')\n\n    required_fields = (\n        'chunk_id',\n        'source_path',\n\
+          \        'text_content',\n        'commit_hash',\n        'source_url',\n\
+          \        'component',\n    )\n\n    todo_markers = ('todo', 'wip', 'coming\
+          \ soon')\n    stability_markers = {\n        'deprecated': 'low_stability:deprecated',\n\
+          \        'alpha': 'low_stability:alpha',\n        'experimental': 'low_stability:experimental',\n\
+          \    }\n    link_pattern = re.compile(r'\\[[^\\]]+\\]\\(([^)]+)\\)')\n\n\
+          \    def normalize_repo_path(base_doc_path, ref_path):\n        cleaned\
+          \ = (ref_path or '').strip()\n        cleaned = cleaned.split('#', 1)[0].split('?',\
+          \ 1)[0]\n        if not cleaned:\n            return ''\n        if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://',\
+          \ cleaned):\n            return ''\n        if cleaned.startswith('/'):\n\
+          \            return cleaned.lstrip('/')\n        normalized = posixpath.normpath(\n\
+          \            posixpath.join(posixpath.dirname(base_doc_path), cleaned))\n\
+          \        if normalized.startswith('../'):\n            return ''\n     \
+          \   return normalized\n\n    stats = {\n        'total': 0,\n        'validated':\
+          \ 0,\n        'dropped_schema': 0,\n        'dropped_stub': 0,\n       \
+          \ 'artifacts_with_broken_links': 0,\n        'total_broken_links': 0,\n\
+          \        'artifacts_with_stability_warnings': 0,\n    }\n    schema_drop_examples\
+          \ = []\n    stub_drop_examples = []\n    broken_link_examples = []\n\n \
+          \   with open(structured_knowledge_artifacts.path, 'r', encoding='utf-8')\
+          \ as inp, open(\n            validated_knowledge_bank.path, 'w',\n     \
+          \       encoding='utf-8') as out:\n        for line in inp:\n          \
+          \  if not line.strip():\n                continue\n            stats['total']\
+          \ += 1\n            record = json.loads(line)\n\n            missing = [field\
+          \ for field in required_fields if not record.get(field)]\n            if\
+          \ missing:\n                stats['dropped_schema'] += 1\n             \
+          \   if len(schema_drop_examples) < 10:\n                    schema_drop_examples.append({\n\
+          \                        'chunk_id': record.get('chunk_id'),\n         \
+          \               'source_path': record.get('source_path'),\n            \
+          \            'missing_fields': missing,\n                    })\n      \
+          \          continue\n\n            text = record.get('text_content', '')\n\
+          \            lowered = text.lower()\n            if len(text.strip()) <\
+          \ 50 or any(marker in lowered\n                                        \
+          \     for marker in todo_markers):\n                stats['dropped_stub']\
+          \ += 1\n                if len(stub_drop_examples) < 10:\n             \
+          \       stub_drop_examples.append({\n                        'chunk_id':\
+          \ record.get('chunk_id'),\n                        'source_path': record.get('source_path'),\n\
+          \                        'reason': 'stub_or_todo',\n                   \
+          \ })\n                continue\n\n            quality_tags = []\n      \
+          \      validation = {\n                'schema_ok': True,\n            \
+          \    'navigational_integrity': 'ok',\n                'semantic_quality':\
+          \ 'ok',\n                'broken_links': [],\n            }\n\n        \
+          \    for marker, tag in stability_markers.items():\n                if marker\
+          \ in lowered:\n                    quality_tags.append(tag)\n\n        \
+          \    if quality_tags:\n                stats['artifacts_with_stability_warnings']\
+          \ += 1\n\n            source_path = record.get('source_path', '')\n    \
+          \        broken_links = []\n            for raw_link in link_pattern.findall(text):\n\
+          \                normalized = normalize_repo_path(source_path, raw_link)\n\
+          \                if not normalized:\n                    continue\n    \
+          \            full_target = os.path.join(repo_root, normalized)\n       \
+          \         if not os.path.exists(full_target):\n                    broken_links.append({\n\
+          \                        'raw_link': raw_link,\n                       \
+          \ 'resolved_path': normalized,\n                    })\n\n            if\
+          \ broken_links:\n                validation['navigational_integrity'] =\
+          \ 'broken_links_detected'\n                validation['broken_links'] =\
+          \ broken_links\n                quality_tags.append('needs_link_check')\n\
+          \                stats['artifacts_with_broken_links'] += 1\n           \
+          \     stats['total_broken_links'] += len(broken_links)\n               \
+          \ if len(broken_link_examples) < 10:\n                    broken_link_examples.append({\n\
+          \                        'chunk_id': record.get('chunk_id'),\n         \
+          \               'source_path': source_path,\n                        'broken_links':\
+          \ broken_links,\n                    })\n\n            record['quality_tags']\
+          \ = sorted(set(quality_tags))\n            record['validation'] = validation\n\
+          \n            stats['validated'] += 1\n            out.write(json.dumps(record)\
+          \ + '\\n')\n\n    validity_ratio = 0 if stats['total'] == 0 else round(\n\
+          \        stats['validated'] / stats['total'], 4)\n    report = f\"\"\"<html><body>\n\
+          <h1>Validation Report</h1>\n<h2>Summary</h2>\n<ul>\n  <li>Total artifacts:\
+          \ {stats['total']}</li>\n  <li>Validated artifacts: {stats['validated']}</li>\n\
+          \  <li>Dropped by schema: {stats['dropped_schema']}</li>\n  <li>Dropped\
+          \ as stub/noise: {stats['dropped_stub']}</li>\n  <li>Artifacts with broken\
+          \ links: {stats['artifacts_with_broken_links']}</li>\n  <li>Total broken\
+          \ links: {stats['total_broken_links']}</li>\n  <li>Artifacts with stability\
+          \ warnings: {stats['artifacts_with_stability_warnings']}</li>\n  <li>Validity\
+          \ ratio: {validity_ratio}</li>\n</ul>\n<h2>Sample dropped records (schema)</h2>\n\
+          <pre>{json.dumps(schema_drop_examples, indent=2)}</pre>\n<h2>Sample dropped\
+          \ records (stub/noise)</h2>\n<pre>{json.dumps(stub_drop_examples, indent=2)}</pre>\n\
+          <h2>Sample broken link findings</h2>\n<pre>{json.dumps(broken_link_examples,\
+          \ indent=2)}</pre>\n</body></html>\"\"\"\n    with open(validation_report.path,\
+          \ 'w', encoding='utf-8') as f:\n        f.write(report)\n\n"
+        image: python:3.11
+pipelineInfo:
+  description: Deterministic ingestion backbone for docs + diagrams.
+  name: docs-agent-ingestion-backbone
+root:
+  dag:
+    tasks:
+      extract-text-docs:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-extract-text-docs
+        dependentTasks:
+        - fetch-sources
+        - filter-manifest
+        inputs:
+          artifacts:
+            source_volume:
+              taskOutputArtifact:
+                outputArtifactKey: source_volume
+                producerTask: fetch-sources
+            text_file_manifest:
+              taskOutputArtifact:
+                outputArtifactKey: text_file_manifest
+                producerTask: filter-manifest
+        taskInfo:
+          name: extract-text-docs
+      fetch-sources:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-fetch-sources
+        inputs:
+          parameters:
+            git_ref:
+              componentInputParameter: git_ref
+            repo_url:
+              componentInputParameter: repo_url
+        taskInfo:
+          name: fetch-sources
+      filter-manifest:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-filter-manifest
+        dependentTasks:
+        - fetch-sources
+        inputs:
+          artifacts:
+            source_volume:
+              taskOutputArtifact:
+                outputArtifactKey: source_volume
+                producerTask: fetch-sources
+        taskInfo:
+          name: filter-manifest
+      persist-and-optimize:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-persist-and-optimize
+        dependentTasks:
+        - validate-ingestion-output
+        inputs:
+          artifacts:
+            validated_knowledge_bank:
+              taskOutputArtifact:
+                outputArtifactKey: validated_knowledge_bank
+                producerTask: validate-ingestion-output
+        taskInfo:
+          name: persist-and-optimize
+      process-visual-artifacts:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-process-visual-artifacts
+        dependentTasks:
+        - fetch-sources
+        - filter-manifest
+        inputs:
+          artifacts:
+            source_volume:
+              taskOutputArtifact:
+                outputArtifactKey: source_volume
+                producerTask: fetch-sources
+            visual_file_manifest:
+              taskOutputArtifact:
+                outputArtifactKey: visual_file_manifest
+                producerTask: filter-manifest
+        taskInfo:
+          name: process-visual-artifacts
+      structure-platform-knowledge:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-structure-platform-knowledge
+        dependentTasks:
+        - extract-text-docs
+        - fetch-sources
+        - process-visual-artifacts
+        inputs:
+          artifacts:
+            provenance_metadata:
+              taskOutputArtifact:
+                outputArtifactKey: provenance_metadata
+                producerTask: fetch-sources
+            structured_text_chunks:
+              taskOutputArtifact:
+                outputArtifactKey: structured_text_chunks
+                producerTask: extract-text-docs
+            structured_visual_artifacts:
+              taskOutputArtifact:
+                outputArtifactKey: structured_visual_artifacts
+                producerTask: process-visual-artifacts
+        taskInfo:
+          name: structure-platform-knowledge
+      validate-ingestion-output:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-validate-ingestion-output
+        dependentTasks:
+        - fetch-sources
+        - structure-platform-knowledge
+        inputs:
+          artifacts:
+            source_volume:
+              taskOutputArtifact:
+                outputArtifactKey: source_volume
+                producerTask: fetch-sources
+            structured_knowledge_artifacts:
+              taskOutputArtifact:
+                outputArtifactKey: structured_knowledge_artifacts
+                producerTask: structure-platform-knowledge
+        taskInfo:
+          name: validate-ingestion-output
+  inputDefinitions:
+    parameters:
+      git_ref:
+        defaultValue: master
+        isOptional: true
+        parameterType: STRING
+      repo_url:
+        defaultValue: https://github.com/kubeflow/pipelines.git
+        isOptional: true
+        parameterType: STRING
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.15.2
